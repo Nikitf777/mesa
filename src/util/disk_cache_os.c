@@ -1091,13 +1091,13 @@ disk_cache_enabled()
     * Don't forget to also set the shader cache path to something readable
     * and writable by the application via `mesa.shader.cache.dir`.
     */
-#if defined(SHADER_CACHE_DISABLE_BY_DEFAULT) || DETECT_OS_ANDROID
+#if defined(SHADER_CACHE_DISABLE_BY_DEFAULT) || MESA_ANDROID_PLATFORM
    bool disable_by_default = true;
 #else
    bool disable_by_default = false;
 #endif
    char *envvar_name = "MESA_SHADER_CACHE_DISABLE";
-#if !DETECT_OS_ANDROID
+#if !MESA_ANDROID_PLATFORM
    if (!os_get_option(envvar_name)) {
       envvar_name = "MESA_GLSL_CACHE_DISABLE";
       if (os_get_option(envvar_name))

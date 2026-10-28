@@ -18,6 +18,16 @@
  */
 
 #if defined(__ANDROID__) || defined(ANDROID)
+#if defined(__has_include)
+#if __has_include(<cutils/native_handle.h>)
+#define VK_ANDROID_HAS_CUTILS_NATIVE_HANDLE 1
+#endif
+#else
+#define VK_ANDROID_HAS_CUTILS_NATIVE_HANDLE 1
+#endif
+#endif
+
+#if defined(VK_ANDROID_HAS_CUTILS_NATIVE_HANDLE)
 
 #include <cutils/native_handle.h>
 #if ANDROID_API_LEVEL < 28

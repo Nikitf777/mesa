@@ -51,7 +51,7 @@ fd_rd_dump_env_init_once(void)
    const char *output_path_value = os_get_option("FD_RD_DUMP_PATH");
    if (!output_path_value) {
       output_path_value =
-#if DETECT_OS_ANDROID
+#if MESA_ANDROID_PLATFORM
          "/data/local/tmp";
 #else
          "/tmp";

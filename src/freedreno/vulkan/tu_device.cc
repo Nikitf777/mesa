@@ -50,8 +50,15 @@
 #include "wsi_common.h"
 #endif
 
-#if DETECT_OS_ANDROID
+#if MESA_ANDROID_PLATFORM && defined(__has_include)
+#if __has_include(<vndk/hardware_buffer.h>)
 #include <vndk/hardware_buffer.h>
+#define TU_HAS_VNDK_HARDWARE_BUFFER 1
+#endif
+#endif
+
+#ifndef TU_HAS_VNDK_HARDWARE_BUFFER
+#define TU_HAS_VNDK_HARDWARE_BUFFER 0
 #endif
 
 uint64_t os_page_size = 4096;
@@ -3772,7 +3779,7 @@ tu_AllocateMemory(VkDevice _device,
          close(fd_info->fd);
       }
    } else if (mem->vk.ahardware_buffer) {
-#if DETECT_OS_ANDROID
+#if TU_HAS_VNDK_HARDWARE_BUFFER
       const native_handle_t *handle = AHardwareBuffer_getNativeHandle(mem->vk.ahardware_buffer);
       assert(handle->numFds > 0);
       size_t size = lseek(handle->data[0], 0, SEEK_END);

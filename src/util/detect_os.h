@@ -98,6 +98,18 @@
 #ifndef DETECT_OS_ANDROID
 #define DETECT_OS_ANDROID 0
 #endif
+
+/*
+ * DETECT_OS_ANDROID only says that the target uses the Android/bionic
+ * toolchain.  It does not necessarily mean that the Android platform
+ * libraries and headers (VNDK, gralloc, libsync, liblog, ...) are present.
+ * Meson defines MESA_ANDROID_PLATFORM from the 'platforms' option; non-Meson
+ * builds fall back to the historical behaviour.
+ */
+#ifndef MESA_ANDROID_PLATFORM
+#define MESA_ANDROID_PLATFORM DETECT_OS_ANDROID
+#endif
+
 #ifndef DETECT_OS_APPLE
 #define DETECT_OS_APPLE 0
 #endif

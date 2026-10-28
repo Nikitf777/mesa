@@ -624,6 +624,10 @@ foreach platform : _platforms
   pre_args += '-DHAVE_@0@_PLATFORM'.format(platform.to_upper())
 endforeach
 
+# Building for bionic does not imply that the Android platform libraries and
+# headers are available (e.g. Termux).  Keep them separate.
+pre_args += '-DMESA_ANDROID_PLATFORM=@0@'.format(with_platform_android.to_int())
+
 if with_platform_android and get_option('platform-sdk-version') >= 29
   # By default the NDK compiler, at least, emits emutls references instead of
   # ELF TLS, even when building targeting newer API levels.  Make it actually do
