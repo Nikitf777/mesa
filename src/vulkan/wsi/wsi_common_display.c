@@ -222,9 +222,15 @@ struct wsi_display {
    mtx_t                        wait_mutex;
    struct u_cnd_monotonic       wait_cond;
    pthread_t                    wait_thread;
+   bool                         wait_thread_stopping;
+   bool                         wait_thread_stop;
+   /* Written to by the stopping thread to wake the worker for shutdown. */
+   int                          wait_stop_pipe[2];
 
    struct u_cnd_monotonic       hotplug_cond;
    pthread_t                    hotplug_thread;
+   bool                         hotplug_thread_stop;
+   int                          hotplug_stop_pipe[2];
 
    struct list_head             connectors; /* list of all discovered connectors */
    /* Flag that we've called wsi_get_connectors() with the current fd.
@@ -2118,25 +2124,85 @@ static drmEventContext event_context = {
    .sequence_handler = wsi_display_sequence_handler,
 };
 
+static bool
+wsi_display_create_stop_pipe(int pipefd[2])
+{
+   if (pipe(pipefd) != 0)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      int flags = fcntl(pipefd[i], F_GETFD);
+      if (flags >= 0)
+         fcntl(pipefd[i], F_SETFD, flags | FD_CLOEXEC);
+   }
+
+   return true;
+}
+
+static void
+wsi_display_drain_stop_pipe(int pipefd[2])
+{
+   char buf[16];
+   struct pollfd pollfd = {
+      .fd = pipefd[0],
+      .events = POLLIN,
+   };
+
+   while (true) {
+      int ret = poll(&pollfd, 1, 0);
+      if (ret < 0) {
+         if (errno == EINTR)
+            continue;
+         break;
+      }
+      if (ret == 0)
+         break;
+
+      ssize_t n = read(pipefd[0], buf, sizeof(buf));
+      if (n < 0 && errno == EINTR)
+         continue;
+      if (n <= 0)
+         break;
+   }
+}
+
+static void
+wsi_display_signal_stop(int pipefd[2])
+{
+   const char byte = 0;
+
+   while (write(pipefd[1], &byte, sizeof(byte)) < 0 && errno == EINTR)
+      ;
+}
+
 static void *
 wsi_display_wait_thread(void *data)
 {
    struct wsi_display *wsi = data;
-   struct pollfd pollfd = {
-      .fd = wsi->fd,
-      .events = POLLIN
+   struct pollfd pollfd[2] = {
+      { .fd = wsi->fd, .events = POLLIN },
+      { .fd = wsi->wait_stop_pipe[0], .events = POLLIN },
    };
 
-   pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-   for (;;) {
-      int ret = poll(&pollfd, 1, -1);
-      if (ret > 0) {
+   while (!p_atomic_read(&wsi->wait_thread_stop)) {
+      int ret = poll(pollfd, ARRAY_SIZE(pollfd), -1);
+      if (ret < 0) {
+         if (errno == EINTR)
+            continue;
+         break;
+      }
+
+      if (pollfd[1].revents & POLLIN)
+         break;
+
+      if (pollfd[0].revents & POLLIN) {
          mtx_lock(&wsi->wait_mutex);
          (void) drmHandleEvent(wsi->fd, &event_context);
          u_cnd_monotonic_broadcast(&wsi->wait_cond);
          mtx_unlock(&wsi->wait_mutex);
       }
    }
+
    return NULL;
 }
 
@@ -2144,6 +2210,9 @@ static int
 wsi_display_start_wait_thread(struct wsi_display *wsi)
 {
    if (!wsi->wait_thread) {
+      p_atomic_set(&wsi->wait_thread_stop, false);
+      wsi_display_drain_stop_pipe(wsi->wait_stop_pipe);
+
       int ret = pthread_create(&wsi->wait_thread, NULL,
                                wsi_display_wait_thread, wsi);
       if (ret)
@@ -2155,13 +2224,31 @@ wsi_display_start_wait_thread(struct wsi_display *wsi)
 static void
 wsi_display_stop_wait_thread(struct wsi_display *wsi)
 {
+   pthread_t thread;
+   bool have_thread = false;
+
    mtx_lock(&wsi->wait_mutex);
-   if (wsi->wait_thread) {
-      pthread_cancel(wsi->wait_thread);
-      pthread_join(wsi->wait_thread, NULL);
-      wsi->wait_thread = 0;
+   if (wsi->wait_thread && !wsi->wait_thread_stopping) {
+      wsi->wait_thread_stopping = true;
+      p_atomic_set(&wsi->wait_thread_stop, true);
+      wsi_display_signal_stop(wsi->wait_stop_pipe);
+      thread = wsi->wait_thread;
+      have_thread = true;
    }
    mtx_unlock(&wsi->wait_mutex);
+
+   if (have_thread) {
+      /* The wait thread may be blocked trying to acquire wait_mutex to
+       * process a DRM event, so don't join while holding it.
+       */
+      pthread_join(thread, NULL);
+
+      mtx_lock(&wsi->wait_mutex);
+      p_atomic_set(&wsi->wait_thread_stop, false);
+      wsi->wait_thread = 0;
+      wsi->wait_thread_stopping = false;
+      mtx_unlock(&wsi->wait_mutex);
+   }
 }
 
 static int
@@ -3634,45 +3721,51 @@ udev_event_listener_thread(void *data)
 
    int udev_fd = udev_monitor_get_fd(mon);
 
-   pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+   struct pollfd fds[2] = {
+      {
+         .fd = udev_fd,
+         .events = POLLIN,
+      },
+      {
+         .fd = wsi->hotplug_stop_pipe[0],
+         .events = POLLIN,
+      },
+   };
 
-   for (;;) {
-      nfds_t nfds = 1;
-      struct pollfd fds[1] =  {
-         {
-            .fd = udev_fd,
-            .events = POLLIN,
-         },
-      };
-
-      int ret = poll(fds, nfds, -1);
-      if (ret > 0) {
-         if (fds[0].revents & POLLIN) {
-            struct udev_device *dev = udev_monitor_receive_device(mon);
-
-            /* Ignore event if it is not a hotplug event */
-            if (!atoi(udev_device_get_property_value(dev, "HOTPLUG")))
-               continue;
-
-            /* Note, this supports both drmSyncobjWait for fence->syncobj
-             * and wsi_display_wait_for_event.
-             */
-            mtx_lock(&wsi->wait_mutex);
-            mtx_lock(&wsi->connectors_mutex);
-            wsi->get_connectors_current = false;
-            mtx_unlock(&wsi->connectors_mutex);
-            u_cnd_monotonic_broadcast(&wsi->hotplug_cond);
-            list_for_each_entry(struct wsi_display_fence, fence,
-                                &wsi_device->hotplug_fences, link) {
-               if (fence->syncobj)
-                  drmSyncobjSignal(wsi->syncobj_fd, &fence->syncobj, 1);
-               fence->event_received = true;
-            }
-            mtx_unlock(&wsi->wait_mutex);
-            udev_device_unref(dev);
-         }
-      } else if (ret < 0) {
+   while (!p_atomic_read(&wsi->hotplug_thread_stop)) {
+      int ret = poll(fds, ARRAY_SIZE(fds), -1);
+      if (ret < 0) {
+         if (errno == EINTR)
+            continue;
          goto fail;
+      }
+
+      if (fds[1].revents & POLLIN)
+         break;
+
+      if (fds[0].revents & POLLIN) {
+         struct udev_device *dev = udev_monitor_receive_device(mon);
+
+         /* Ignore event if it is not a hotplug event */
+         if (!atoi(udev_device_get_property_value(dev, "HOTPLUG")))
+            continue;
+
+         /* Note, this supports both drmSyncobjWait for fence->syncobj
+          * and wsi_display_wait_for_event.
+          */
+         mtx_lock(&wsi->wait_mutex);
+         mtx_lock(&wsi->connectors_mutex);
+         wsi->get_connectors_current = false;
+         mtx_unlock(&wsi->connectors_mutex);
+         u_cnd_monotonic_broadcast(&wsi->hotplug_cond);
+         list_for_each_entry(struct wsi_display_fence, fence,
+                             &wsi_device->hotplug_fences, link) {
+            if (fence->syncobj)
+               drmSyncobjSignal(wsi->syncobj_fd, &fence->syncobj, 1);
+            fence->event_received = true;
+         }
+         mtx_unlock(&wsi->wait_mutex);
+         udev_device_unref(dev);
       }
    }
 
@@ -3761,6 +3854,18 @@ wsi_display_init_wsi(struct wsi_device *wsi_device,
       goto fail_hotplug_cond;
    }
 
+   if (!wsi_display_create_stop_pipe(wsi->wait_stop_pipe)) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_hotplug_cond;
+   }
+
+   if (!wsi_display_create_stop_pipe(wsi->hotplug_stop_pipe)) {
+      close(wsi->wait_stop_pipe[0]);
+      close(wsi->wait_stop_pipe[1]);
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_hotplug_cond;
+   }
+
    wsi->base.get_support = wsi_display_surface_get_support;
    wsi->base.get_capabilities2 = wsi_display_surface_get_capabilities2;
    wsi->base.get_formats = wsi_display_surface_get_formats;
@@ -3799,9 +3904,16 @@ wsi_display_finish_wsi(struct wsi_device *wsi_device,
       wsi_display_stop_wait_thread(wsi);
 
       if (wsi->hotplug_thread) {
-         pthread_cancel(wsi->hotplug_thread);
+         p_atomic_set(&wsi->hotplug_thread_stop, true);
+         wsi_display_signal_stop(wsi->hotplug_stop_pipe);
          pthread_join(wsi->hotplug_thread, NULL);
+         wsi->hotplug_thread = 0;
       }
+
+      close(wsi->wait_stop_pipe[0]);
+      close(wsi->wait_stop_pipe[1]);
+      close(wsi->hotplug_stop_pipe[0]);
+      close(wsi->hotplug_stop_pipe[1]);
 
       mtx_destroy(&wsi->connectors_mutex);
       mtx_destroy(&wsi->wait_mutex);
@@ -4403,6 +4515,9 @@ wsi_register_device_event(VkDevice _device,
    /* Start listening for output change notifications. */
    mtx_lock(&wsi->wait_mutex);
    if (!wsi->hotplug_thread) {
+      p_atomic_set(&wsi->hotplug_thread_stop, false);
+      wsi_display_drain_stop_pipe(wsi->hotplug_stop_pipe);
+
       if (pthread_create(&wsi->hotplug_thread, NULL, udev_event_listener_thread,
                          wsi_device)) {
          mtx_unlock(&wsi->wait_mutex);
